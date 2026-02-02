@@ -1,4 +1,5 @@
 use crate::persistence::item_persistence::{ItemStreamReader, ItemStreamWriter};
+use crate::persistence::shared_file::{SharedFile, get_shared_file_registry};
 
 use async_trait::async_trait;
 use fs2::FileExt;
@@ -6,10 +7,14 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::File as TokioFile;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 static OUTPUT_FOLDER_PATH: &'static str = "tmp_outputs";
+const CHUNK_SIZE: usize = 8192; // 8KB chunks for reading
+
 macro_rules! metadata_format {
     () => {
         r#"<metadata>
@@ -29,6 +34,8 @@ pub struct FileWriter {
     data_file: TokioFile,
     metadata_file: File,
     item_version: u64,
+    shared_file: Arc<SharedFile>,
+    current_offset: u64,
 }
 
 impl FileWriter {
@@ -78,6 +85,7 @@ impl FileWriter {
         // 3. Open, Lock & Truncate the Data File
         let mut data_file = OpenOptions::new()
             .write(true)
+            .read(true) // Need read access for shared file
             .create(true)
             .open(&versioned_path)
             .map_err(|error| format!("Data file open error: {error}"))?;
@@ -89,10 +97,34 @@ impl FileWriter {
 
         let data_file = TokioFile::from_std(data_file);
 
+        // 4. Create or get shared file for this item/version
+        let item_id_clone = item_id.clone();
+        let version_clone = *item_version;
+        let metadata_path_clone = metadata_path.clone();
+        let versioned_path_clone = versioned_path.clone();
+
+        let shared_file =
+            get_shared_file_registry().get_or_create(item_id_clone, version_clone, || {
+                // Create a new shared file handle
+                let file_handle = OpenOptions::new()
+                    .read(true)
+                    .open(&versioned_path_clone)
+                    .map_err(|e| e.to_string())?;
+                let tokio_file = TokioFile::from_std(file_handle);
+
+                Ok(SharedFile::new(
+                    tokio_file,
+                    versioned_path_clone,
+                    metadata_path_clone,
+                ))
+            })?;
+
         Ok(Self {
             data_file,
             metadata_file,
             item_version: *item_version,
+            shared_file,
+            current_offset: 0,
         })
     }
 }
@@ -100,7 +132,7 @@ impl FileWriter {
 #[async_trait]
 impl ItemStreamWriter for FileWriter {
     async fn write_chunk(&mut self, chunk: Vec<u8>) -> Result<(), String> {
-        println!("Writing {} bytes", chunk.len());
+        let chunk_len = chunk.len();
         self.data_file
             .write_all(&chunk)
             .await
@@ -109,6 +141,11 @@ impl ItemStreamWriter for FileWriter {
             .sync_data()
             .await
             .map_err(|error| format!("Failed to sync data to disk: {error}"))?;
+
+        // Update shared file state
+        self.current_offset += chunk_len as u64;
+        self.shared_file.update_size(self.current_offset);
+
         Ok(())
     }
 
@@ -126,14 +163,17 @@ impl ItemStreamWriter for FileWriter {
         self.metadata_file
             .sync_all()
             .map_err(|error| error.to_string())?;
+
+        // Mark shared file as finished
+        self.shared_file.mark_finished();
+
         Ok(())
     }
 }
 
 pub struct FileReader {
-    data_file: TokioFile,
-    metadata_path: String,
-    target_version: u64,
+    shared_file: Arc<SharedFile>,
+    current_offset: AtomicU64,
 }
 
 impl FileReader {
@@ -141,18 +181,46 @@ impl FileReader {
         let metadata_path = format!("{}/{}_metadata.xml", OUTPUT_FOLDER_PATH, item_id);
         let data_path = format!("{}/{}_{}.xml", OUTPUT_FOLDER_PATH, item_id, item_version);
 
-        let file_handle = std::fs::File::open(&data_path).map_err(|err| err.to_string())?;
-        file_handle.lock_shared().map_err(|err| err.to_string())?;
+        // Try to get existing shared file from registry (active writer case)
+        let shared_file = match get_shared_file_registry().get(&item_id, item_version) {
+            Some(sf) => sf,
+            None => {
+                // Check if file exists on disk
+                if !std::path::Path::new(&data_path).exists() {
+                    // File doesn't exist - return 404 Not Found
+                    return Err(format!("Item not found"));
+                }
+
+                // File exists - open it
+                let file_handle =
+                    std::fs::File::open(&data_path).map_err(|_| format!("Item not found"))?;
+                file_handle.lock_shared().map_err(|err| err.to_string())?;
+
+                // Get initial file size
+                let metadata = std::fs::metadata(&data_path).map_err(|err| err.to_string())?;
+                let file_size = metadata.len();
+
+                let tokio_file = TokioFile::from_std(file_handle);
+                let sf = SharedFile::new(tokio_file, data_path, metadata_path);
+                sf.file_size.store(file_size, Ordering::Release);
+
+                // Check if already finished
+                if Self::check_is_finished(&sf) {
+                    sf.mark_finished();
+                }
+
+                sf
+            }
+        };
 
         Ok(Self {
-            data_file: TokioFile::from_std(file_handle),
-            metadata_path,
-            target_version: item_version,
+            shared_file,
+            current_offset: AtomicU64::new(0),
         })
     }
 
-    fn is_finished(&self) -> bool {
-        let mut metadata_handle = match std::fs::File::open(&self.metadata_path) {
+    fn check_is_finished(shared_file: &SharedFile) -> bool {
+        let mut metadata_handle = match std::fs::File::open(&shared_file.metadata_path) {
             Ok(handle) => handle,
             Err(_) => return false,
         };
@@ -167,50 +235,68 @@ impl FileReader {
                         .read_text(element.name())
                         .map_err(|_| "")
                         .unwrap_or_default();
-                    let latest_version = version_string.parse::<u64>().unwrap_or(0);
-                    return latest_version >= self.target_version;
+                    let _latest_version = version_string.parse::<u64>().unwrap_or(0);
+                    return true; // If metadata exists with version, it's finished
                 }
             }
         }
         false
+    }
+
+    fn is_finished(&self) -> bool {
+        self.shared_file.is_finished()
     }
 }
 
 #[async_trait]
 impl ItemStreamReader for FileReader {
     async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
-        let mut read_buffer = Vec::with_capacity(1000);
-        let mut temp_buffer = [0u8; 1];
-        let mut bytes_read = 0;
+        let mut buffer = vec![0u8; CHUNK_SIZE];
 
         loop {
-            // Read exactly one byte at a time to check for available data
-            match self.data_file.read_exact(&mut temp_buffer).await {
-                Ok(_) => {
-                    read_buffer.push(temp_buffer[0]);
-                    bytes_read += 1;
+            let offset = self.current_offset.load(Ordering::Acquire);
+            let file_size = self.shared_file.get_size();
 
-                    // If we have a full chunk, return it
-                    if bytes_read == 1000 {
-                        println!("Read chunk: {} bytes", bytes_read);
-                        return Ok(Some(read_buffer));
-                    }
+            // Check if there's data available to read
+            if offset < file_size {
+                // Read available data
+                let to_read = std::cmp::min(CHUNK_SIZE, (file_size - offset) as usize);
+
+                let bytes_read = self
+                    .shared_file
+                    .read_at(offset, &mut buffer[..to_read])
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                if bytes_read > 0 {
+                    self.current_offset
+                        .fetch_add(bytes_read as u64, Ordering::Release);
+                    buffer.truncate(bytes_read);
+                    return Ok(Some(buffer));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // 2. EOF reached: Check if writer is actually done
+            }
+
+            // Check if we're at EOF and file is finished
+            if offset >= file_size && self.is_finished() {
+                return Ok(None);
+            }
+
+            // Wait for new data to be written
+            // Use a timeout to prevent indefinite waiting
+            let timeout = tokio::time::Duration::from_secs(30);
+            let notified =
+                tokio::time::timeout(timeout, self.shared_file.write_notify.notified()).await;
+
+            match notified {
+                Ok(_) => continue, // Notified of new data, try reading again
+                Err(_) => {
+                    // Timeout - check if file is finished
                     if self.is_finished() {
-                        println!("Reader detected finish. Terminating stream.");
-                        if bytes_read > 0 {
-                            println!("Read chunk: {} bytes", bytes_read);
-                            return Ok(Some(read_buffer));
-                        }
                         return Ok(None);
                     }
-                    // 3. Not finished: Sleep and retry (Tail -f behavior)
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    // Otherwise continue waiting
                     continue;
                 }
-                Err(read_error) => return Err(read_error.to_string()),
             }
         }
     }

@@ -1,3 +1,14 @@
-/target
-/tmp_inputs
-/tmp_outputs
+# Ignore everything
+*
+
+# But not the src directory
+!/src
+# But not the .gitignore file
+!.gitignore
+# Rust requirements
+!Cargo.toml
+!Cargo.lock
+
+# Ignore README and LICENSE
+!README.md
+!LICENSE

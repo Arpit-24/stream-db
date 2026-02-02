@@ -25,12 +25,10 @@ pub async fn read_item_stream(item_id: String, item_version: u64) -> impl IntoRe
         loop {
             match component.read_chunk().await {
                 Ok(Some(chunk)) => {
-                    println!("Reading {} bytes", chunk.len());
                     // Yielding chunk as-is - ensure it's sent immediately
                     yield Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(chunk));
                 }
                 Ok(None) => {
-                    println!("Read complete");
                     break;
                 }
                 Err(e) => {
