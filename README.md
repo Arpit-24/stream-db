@@ -5,21 +5,35 @@ A high-performance streaming database written in Rust that enables real-time wri
 ## What is stream-db?
 
 stream-db is a streaming database that allows you to:
-- **Write data** in real-time using HTTP streams
-- **Read data** as it's being written
-- **Support multiple concurrent readers** consuming the same stream
-- **Store structured property data** with explicit type information
+- **Write structured property data** in real-time using HTTP streams
+- **Read data** as it's being written by multiple concurrent readers
+- **Support multiple readers** consuming the same stream simultaneously
+- **Store typed property data** with explicit type information
 
 Unlike traditional databases that require complete transactions before reading, stream-db enables real-time data access scenarios where readers can start consuming data before the writer finishes.
 
-## How It Works
+## Quick Start
 
-### Architecture Overview
+```bash
+# Build and run the server
+cargo build
+cargo run
+
+# In another terminal - write data
+curl -X POST http://localhost:3000/write-item-stream/myitem/1 \
+  -H "Content-Type: application/xml" \
+  -d '<property for="name"><string>Test</string></property>'
+
+# In another terminal - read data
+curl -N http://localhost:3000/read-item-stream/myitem/1
+```
+
+## Architecture
 
 ```
 ┌─────────────┐         ┌─────────────┐         ┌─────────────┐
 │   Writer    │ ──────► │   Server    │ ──────► │   Readers   │
-│  (HTTP)     │         │  (Tokio)    │         │  (Streams)  │
+│  (HTTP)     │  XML    │  (Axum)     │  Stream │  (Multiple) │
 └─────────────┘         └─────────────┘         └─────────────┘
                                 │
                                 ▼
@@ -29,34 +43,6 @@ Unlike traditional databases that require complete transactions before reading, 
                        └─────────────┘
 ```
 
-### Storage Structure
-
-Each item is stored in two files:
-
-1. **Metadata File** (`{item_id}_{version}.meta`)
-   - Contains item metadata including item ID, version, creation timestamp
-   - Property index for fast lookups
-   - File size tracking
-
-2. **Data File** (`{item_id}_{version}.data`)
-   - Contains the actual property data in XML format
-   - Append-only structure for streaming writes
-
-### Streaming Behavior
-
-1. **Writer** sends property data in chunks via HTTP POST
-2. **Server** parses and validates each XML chunk
-3. **File Writer** appends valid properties to the data file
-4. **Shared File Registry** tracks file state and notifies readers
-5. **Readers** are notified when new data is available and can stream it in real-time
-
-### Concurrency Model
-
-- **File Locking**: Uses `fs2` for atomic file operations
-- **Async I/O**: Built on Tokio for efficient asynchronous operations
-- **Shared Registry**: Coordinates between writers and readers
-- **Notification System**: Readers are notified when new data arrives
-
 ## API Endpoints
 
 ### Write API
@@ -65,13 +51,13 @@ Each item is stored in two files:
 
 **Content-Type**: `application/xml`
 
-**Description**: Stream property data to an item. Properties can be sent in multiple chunks.
+**Description**: Stream property data to an item. Properties can be sent in chunks.
 
 **Example**:
 ```bash
 curl -X POST http://localhost:3000/write-item-stream/test_item/1 \
   -H "Content-Type: application/xml" \
-  -d '<property for="name"><string>Test User</string></property>'
+  -d '<property for="name"><string>John Doe</string></property>'
 ```
 
 **Response Codes**:
@@ -84,23 +70,18 @@ curl -X POST http://localhost:3000/write-item-stream/test_item/1 \
 
 **Endpoint**: `GET /read-item-stream/{item_id}/{version}`
 
-**Description**: Stream item data as it's being written. Readers receive raw bytes from the data file.
+**Description**: Stream item data as it's being written. Multiple readers can consume data simultaneously.
 
 **Example**:
 ```bash
 curl -N http://localhost:3000/read-item-stream/user123/1
 ```
 
-**Features**:
-- Multiple readers can consume data while it's being written
-- Readers are notified when new data arrives
-- Supports long-lived connections for real-time streaming
-
 ## Data Format
 
 ### Property XML Format
 
-Properties are stored in typed XML format:
+Properties use a typed XML format with explicit type information:
 
 ```xml
 <item>
@@ -115,10 +96,77 @@ Properties are stored in typed XML format:
 ### Supported Types
 
 - `string`: Text values
-- `number`: Numeric values (integers and floats)
+- `number`: Numeric values (floating point)
 - `boolean`: True/false values
 - `datetime`: ISO 8601 formatted timestamps
 - `binary`: Base64-encoded binary data
+
+## Streaming Examples
+
+### Rate-Limited Streaming Writer
+
+Test streaming with a slow writer using rate limiting:
+
+```bash
+# Start rate-limited writer (5000 bytes/sec)
+curl -X POST http://localhost:3000/write-item-stream/test/1 \
+  -H "Content-Type: application/xml" \
+  --limit-rate 5000 \
+  --data-binary @tmp_inputs/large_stream.xml
+```
+
+### Concurrent Readers
+
+Test multiple readers consuming the same stream:
+
+```bash
+# Terminal 1: Start 6 readers
+for i in {1..6}; do
+  curl -N "http://localhost:3000/read-item-stream/test_item/1" > "/tmp/reader_${i}.log" &
+done
+
+# Terminal 2: Start writer
+for i in {1..20}; do
+  echo '<property for="item_'${i}'"><string>Value '${i}'</string></property>'
+  sleep 0.1
+done | curl -X POST http://localhost:3000/write-item-stream/test_item/1 \
+  -H "Content-Type: application/xml" \
+  --data-binary @-
+```
+
+### Full Concurrent Test
+
+Run the included test script that demonstrates true streaming:
+
+```bash
+bash test_concurrent.sh
+```
+
+This test:
+1. Starts a rate-limited writer (5000 bytes/sec)
+2. Waits 2 seconds
+3. Starts 6 readers while writer is still streaming
+4. All readers receive complete data concurrently
+
+Sample output:
+```
+[23:02:39.3N] Writer started
+[23:02:41.3N] Readers 1-6 started (while writer still streaming)
+[23:03:02.3N] Writer finished (~20 seconds later)
+[23:03:05.3N] All 6 readers received 1000 lines each ✓
+```
+
+## Storage Structure
+
+Each item is stored in two files in `tmp_outputs/`:
+
+1. **Data File** (`{item_id}_{version}.xml`)
+   - Contains the actual property data in XML format
+   - Append-only structure for streaming writes
+
+2. **Metadata File** (`{item_id}_metadata.xml`)
+   - Contains version information
+   - Used to track completion status
 
 ## Features
 
@@ -127,84 +175,7 @@ Properties are stored in typed XML format:
 - **Streaming**: Support for large datasets through chunked transfers
 - **Atomic Operations**: Thread-safe file operations using `fs2` for file locking
 - **Async I/O**: Built on Tokio for efficient asynchronous operations
-- **Property Indexing**: Metadata includes property index for future search capabilities
-
-## Technology Stack
-
-- **Rust 2024 Edition**: Modern Rust with latest language features
-- **Tokio**: Async runtime for efficient I/O operations
-- **Axum**: Web framework for HTTP API endpoints
-- **quick-xml**: Fast XML parsing and serialization
-- **serde/serde_json**: JSON serialization support
-- **fs2**: File locking for concurrent access
-- **uuid**: Unique identifier generation
-
-## Installation
-
-```bash
-# Clone the repository
-git clone <repository-url>
-cd stream-db
-
-# Build the project
-cargo build --release
-
-# Run the server
-cargo run
-```
-
-## Usage
-
-### Starting the Server
-
-```bash
-cargo run
-```
-
-The server will start on `http://localhost:3000` by default.
-
-### Writing Data
-
-Write properties in chunks:
-
-```bash
-# Chunk 1
-curl -X POST http://localhost:3000/write-item-stream/user123/1 \
-  -H "Content-Type: application/xml" \
-  -d '<property for="name"><string>John Doe</string></property>'
-
-# Chunk 2
-curl -X POST http://localhost:3000/write-item-stream/user123/1 \
-  -H "Content-Type: application/xml" \
-  -d '<property for="email"><string>john@example.com</string></property>'
-```
-
-### Reading Data
-
-Stream data as it's being written:
-
-```bash
-curl -N http://localhost:3000/read-item-stream/user123/1
-```
-
-### Concurrent Write and Read
-
-You can have multiple readers consuming data while a writer is streaming:
-
-```bash
-# Terminal 1: Start readers
-for i in {1..3}; do
-  curl -N "http://localhost:3000/read-item-stream/test_item/1" > "/tmp/reader_${i}.log" &
-done
-
-# Terminal 2: Write data in chunks
-for i in {1..10}; do
-  curl -X POST http://localhost:3000/write-item-stream/test_item/1 \
-    -H "Content-Type: application/xml" \
-    -d "<property for=\"chunk_${i}\"><string>Data chunk ${i}</string></property>"
-  sleep 0.5
-done
-```
+- **Real-time**: Readers receive data as it arrives, not after completion
 
 ## Project Structure
 
@@ -213,8 +184,25 @@ stream-db/
 ├── Cargo.toml              # Project dependencies
 ├── README.md               # This file
 ├── LICENSE                 # License information
-├── src/                    # Source code
-│   └── ...                 # Source files
+├── src/
+│   ├── main.rs            # Application entry point
+│   ├── api/
+│   │   ├── mod.rs
+│   │   ├── write_item_stream_api.rs
+│   │   └── read_item_stream_api.rs
+│   ├── component/
+│   │   ├── mod.rs
+│   │   └── item_stream_component.rs
+│   ├── logic/
+│   │   ├── mod.rs
+│   │   └── item_stream_logic.rs
+│   ├── persistence/
+│   │   ├── mod.rs
+│   │   ├── file_persistence.rs
+│   │   ├── item_persistence.rs
+│   │   ├── property_serialization.rs
+│   │   └── shared_file.rs
+│   └── types.rs           # Property and data types
 ```
 
 ## Development
@@ -228,6 +216,10 @@ cargo build
 ### Running Tests
 
 ```bash
+# Run the concurrent streaming test
+bash test_concurrent.sh
+
+# Standard cargo tests
 cargo test
 ```
 
@@ -254,7 +246,3 @@ cargo fmt
 ## License
 
 See [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.

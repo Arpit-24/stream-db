@@ -2,6 +2,7 @@ mod api;
 mod component;
 mod logic;
 mod persistence;
+mod types;
 
 use api::write_item_stream_api;
 
@@ -27,15 +28,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/write-item-stream/{item_id}/{version}",
             post(
                 |path: Path<(String, u64)>, request: Request<Body>| async move {
-                    return write_item_stream_api::write_item_stream(path.0.0, path.0.1, request)
-                        .await;
+                    write_item_stream_api::write_item_stream(path.0.0, path.0.1, request).await
                 },
             ),
         )
         .route(
             "/read-item-stream/{item_id}/{version}",
             get(|path: Path<(String, u64)>| async move {
-                return read_item_stream_api::read_item_stream(path.0.0, path.0.1).await;
+                read_item_stream_api::read_item_stream(path.0.0, path.0.1).await
             }),
         );
 

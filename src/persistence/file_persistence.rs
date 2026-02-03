@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::File as TokioFile;
 use tokio::io::AsyncWriteExt;
 
-static OUTPUT_FOLDER_PATH: &'static str = "tmp_outputs";
+static OUTPUT_FOLDER_PATH: &str = "tmp_outputs";
 const CHUNK_SIZE: usize = 8192; // 8KB chunks for reading
 
 macro_rules! metadata_format {
@@ -48,6 +48,7 @@ impl FileWriter {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&metadata_path)
             .map_err(|error| format!("Metadata open error: {error}"))?;
 
@@ -87,6 +88,7 @@ impl FileWriter {
             .write(true)
             .read(true) // Need read access for shared file
             .create(true)
+            .truncate(true)
             .open(&versioned_path)
             .map_err(|error| format!("Data file open error: {error}"))?;
         data_file
@@ -178,38 +180,12 @@ pub struct FileReader {
 
 impl FileReader {
     pub fn new(item_id: String, item_version: u64) -> Result<Self, String> {
-        let metadata_path = format!("{}/{}_metadata.xml", OUTPUT_FOLDER_PATH, item_id);
-        let data_path = format!("{}/{}_{}.xml", OUTPUT_FOLDER_PATH, item_id, item_version);
-
         // Try to get existing shared file from registry (active writer case)
         let shared_file = match get_shared_file_registry().get(&item_id, item_version) {
             Some(sf) => sf,
             None => {
-                // Check if file exists on disk
-                if !std::path::Path::new(&data_path).exists() {
-                    // File doesn't exist - return 404 Not Found
-                    return Err(format!("Item not found"));
-                }
-
-                // File exists - open it
-                let file_handle =
-                    std::fs::File::open(&data_path).map_err(|_| format!("Item not found"))?;
-                file_handle.lock_shared().map_err(|err| err.to_string())?;
-
-                // Get initial file size
-                let metadata = std::fs::metadata(&data_path).map_err(|err| err.to_string())?;
-                let file_size = metadata.len();
-
-                let tokio_file = TokioFile::from_std(file_handle);
-                let sf = SharedFile::new(tokio_file, data_path, metadata_path);
-                sf.file_size.store(file_size, Ordering::Release);
-
-                // Check if already finished
-                if Self::check_is_finished(&sf) {
-                    sf.mark_finished();
-                }
-
-                sf
+                // File doesn't exist - return 404 Not Found
+                return Err("Item not found".to_string());
             }
         };
 
@@ -219,6 +195,7 @@ impl FileReader {
         })
     }
 
+    #[allow(dead_code)]
     fn check_is_finished(shared_file: &SharedFile) -> bool {
         let mut metadata_handle = match std::fs::File::open(&shared_file.metadata_path) {
             Ok(handle) => handle,
@@ -229,15 +206,15 @@ impl FileReader {
         let mut xml_reader = Reader::from_reader(&metadata_bytes[..]);
         let mut event_buffer = Vec::new();
         while let Ok(xml_event) = xml_reader.read_event_into(&mut event_buffer) {
-            if let Event::Start(ref element) = xml_event {
-                if element.name().as_ref() == b"version" {
-                    let version_string = xml_reader
-                        .read_text(element.name())
-                        .map_err(|_| "")
-                        .unwrap_or_default();
-                    let _latest_version = version_string.parse::<u64>().unwrap_or(0);
-                    return true; // If metadata exists with version, it's finished
-                }
+            if let Event::Start(ref element) = xml_event
+                && element.name().as_ref() == b"version"
+            {
+                let version_string = xml_reader
+                    .read_text(element.name())
+                    .map_err(|_| "")
+                    .unwrap_or_default();
+                let _latest_version = version_string.parse::<u64>().unwrap_or(0);
+                return true; // If metadata exists with version, it's finished
             }
         }
         false

@@ -33,7 +33,7 @@ pub async fn read_item_stream(item_id: String, item_version: u64) -> impl IntoRe
                 }
                 Err(e) => {
                     println!("Read error: {}", e);
-                    yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                    yield Err(std::io::Error::other(e));
                     break;
                 }
             }

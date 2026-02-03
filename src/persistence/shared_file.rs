@@ -20,6 +20,7 @@ pub struct SharedFile {
     #[allow(dead_code)]
     pub data_path: String,
     /// Path to the metadata file
+    #[allow(dead_code)]
     pub metadata_path: String,
 }
 
